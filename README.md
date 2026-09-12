@@ -37,6 +37,13 @@ npx vercel deploy --prod
 本地密钥、账号数据库、上传图片、日志、路演材料和过程文件不进入部署包。
 数据库免费档有用量限制，模型调用费用独立计算。
 
+线上当前通过百炼北京标准接口 `https://dashscope.aliyuncs.com/compatible-mode/v1`
+调用模型。聊天使用 `qwen-plus-2025-07-28`，图片使用 `qwen-vl-max`，
+向量使用 `text-embedding-v4`。这些模型的额度与有效期在百炼控制台单独管理。
+
+依赖由 `uv.lock` 固定；修改 `pyproject.toml` 后运行 `uv lock --python 3.12`，
+并提交更新后的锁文件。Vercel 构建会按锁文件安装依赖。
+
 ## 验证
 
 ```sh

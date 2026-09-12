@@ -1,7 +1,7 @@
 # 运行时依赖（文档十二：只要这几个；爬虫脚本的依赖单独在 scripts/ 阶段装）
 fastapi
 uvicorn
-openai
+openai==2.53.0
 numpy
 python-dotenv
 python-multipart
