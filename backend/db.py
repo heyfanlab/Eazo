@@ -1,11 +1,18 @@
 # 数据库：SQLite 建表 + 基础操作（文档第四节）。
 import logging
 import sqlite3
+import json
+import secrets
 from datetime import datetime
 
 from . import config, safety_rules
 
 logger = logging.getLogger(__name__)
+try:
+    from psycopg import IntegrityError as PostgresIntegrityError
+except ImportError:
+    PostgresIntegrityError = sqlite3.IntegrityError
+INTEGRITY_ERRORS = (sqlite3.IntegrityError, PostgresIntegrityError)
 
 # 建表 SQL（字段含义见技术文档第四节）
 _SCHEMA = """
@@ -96,11 +103,28 @@ CREATE TABLE IF NOT EXISTS sessions (
     user_id    INTEGER NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS agent_traces (
+    user_id INTEGER PRIMARY KEY,
+    trace_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS uploads (
+    object_key TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    content BLOB NOT NULL,
+    content_type TEXT NOT NULL
+);
 """
 
 
 def get_conn() -> sqlite3.Connection:
     """拿一个连接。row_factory 设成 Row，方便按列名取值。"""
+    if config.DATABASE_URL:
+        from .postgres import Connection
+        return Connection()
+    if config.IS_VERCEL:
+        raise RuntimeError("Vercel deployment requires DATABASE_URL; local SQLite is not persistent")
     conn = sqlite3.connect(config.DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -120,9 +144,15 @@ def init_db() -> None:
     """建表（幂等），并给 app_clock 播种初始虚拟时间。"""
     conn = get_conn()
     try:
-        conn.executescript(_SCHEMA)
+        if config.DATABASE_URL:
+            conn.execute("SELECT pg_advisory_xact_lock(1280134477, 0)")
+            conn.executescript(_SCHEMA.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY").replace(" BLOB ", " BYTEA "))
+        else:
+            conn.executescript(_SCHEMA)
         # 轻量迁移：老库的 profiles 缺列时补上（SQLite 不支持 IF NOT EXISTS 加列）
-        cols = [r["name"] for r in conn.execute("PRAGMA table_info(profiles)")]
+        cols = ([r["column_name"] for r in conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'profiles'")]
+            if config.DATABASE_URL else [r["name"] for r in conn.execute("PRAGMA table_info(profiles)")])
         if "wake_time" not in cols:
             conn.execute("ALTER TABLE profiles ADD COLUMN wake_time TEXT")
             logger.info("db 迁移：profiles 表补充 wake_time 列")
@@ -143,7 +173,41 @@ def init_db() -> None:
             )
             logger.info("db 初始化：app_clock 播种 virtual_now=%s", initial)
         conn.commit()
-        logger.info("db 初始化完成：%s", config.DB_PATH)
+        logger.info("db 初始化完成：%s", "PostgreSQL" if config.DATABASE_URL else config.DB_PATH)
+    finally:
+        conn.close()
+
+
+def save_trace(user_id: int, trace: dict) -> None:
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO agent_traces (user_id, trace_json) VALUES (?, ?) "
+            "ON CONFLICT (user_id) DO UPDATE SET trace_json = excluded.trace_json",
+            (user_id, json.dumps(trace, ensure_ascii=False)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_trace(user_id: int):
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT trace_json FROM agent_traces WHERE user_id = ?", (user_id,)).fetchone()
+        return json.loads(row["trace_json"]) if row else None
+    finally:
+        conn.close()
+
+
+def save_upload(user_id: int, content: bytes, content_type: str) -> str:
+    key = secrets.token_hex(16)
+    conn = get_conn()
+    try:
+        conn.execute("INSERT INTO uploads (object_key, user_id, content, content_type) VALUES (?, ?, ?, ?)",
+                     (key, user_id, content, content_type))
+        conn.commit()
+        return "db:" + key
     finally:
         conn.close()
 

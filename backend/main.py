@@ -1,6 +1,7 @@
 # FastAPI 入口 + 路由。
 # 启动：uvicorn backend.main:app --reload
 import hashlib
+import hmac
 import json
 import logging
 import secrets
@@ -13,6 +14,7 @@ import re
 from fastapi import FastAPI, Request, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 from . import agent, clock, config, db, extract, llm, safety
 from .logging_setup import setup_logging
@@ -21,6 +23,18 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="最低自我照顾 Agent")
+
+
+class AIUnavailable(Exception):
+    pass
+
+
+@app.exception_handler(AIUnavailable)
+async def ai_unavailable_handler(request: Request, exc: AIUnavailable):
+    return JSONResponse(status_code=503, content={
+        "error": "AI 暂时无法生成建议，你的资料已保存。请稍后再试。",
+        "code": "AI_UNAVAILABLE",
+    })
 
 
 @app.on_event("startup")
@@ -46,7 +60,29 @@ async def log_requests(request: Request, call_next):
 # ---------- 账号与登录态（M1；文档要求：密码 hash 即可，不做复杂安全） ----------
 
 def _hash_password(password: str, salt: str) -> str:
-    return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    return "pbkdf2_sha256:600000:" + hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), 600000
+    ).hex()
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    try:
+        salt, expected = stored.split("$", 1)
+        actual = (_hash_password(password, salt) if expected.startswith("pbkdf2_sha256:")
+                  else hashlib.sha256((salt + password).encode("utf-8")).hexdigest())
+        return hmac.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+@app.get("/api/health")
+def api_health():
+    conn = db.get_conn()
+    try:
+        conn.execute("SELECT 1").fetchone()
+        return {"ok": True}
+    finally:
+        conn.close()
 
 
 def _current_user_id(request: Request):
@@ -64,7 +100,7 @@ def _issue_token(user_id: int) -> str:
 
 
 @app.post("/api/register")
-async def api_register(payload: dict):
+def api_register(payload: dict):
     """注册：{username, password}。成功后直接发 token（省一次登录）。"""
     username = str(payload.get("username", "")).strip()
     password = str(payload.get("password", ""))
@@ -75,14 +111,14 @@ async def api_register(payload: dict):
         user_id = db.create_user(
             username, f"{salt}${_hash_password(password, salt)}", clock.now().isoformat()
         )
-    except sqlite3.IntegrityError:
+    except db.INTEGRITY_ERRORS:
         return JSONResponse(status_code=400, content={"error": "用户名已存在"})
     logger.info("user=%s event=register 注册成功 user_id=%s", username, user_id)
     return {"token": _issue_token(user_id)}
 
 
 @app.post("/api/auth")
-async def api_auth(payload: dict):
+def api_auth(payload: dict):
     """登录/注册合一（前端单按钮「进入」）：
     - 用户名不存在 → 自动注册并发 token（返回 new=True）
     - 用户名存在 + 密码正确 → 登录发 token（new=False）
@@ -99,12 +135,11 @@ async def api_auth(payload: dict):
             user_id = db.create_user(
                 username, f"{salt}${_hash_password(password, salt)}", clock.now().isoformat()
             )
-        except sqlite3.IntegrityError:
+        except db.INTEGRITY_ERRORS:
             return JSONResponse(status_code=409, content={"error": "网络有点挤，再点一次"})
         logger.info("user=%s event=register 注册成功 user_id=%s", username, user_id)
         return {"token": _issue_token(user_id), "new": True}
-    salt, stored_hash = user["password_hash"].split("$", 1)
-    if _hash_password(password, salt) != stored_hash:
+    if not _verify_password(password, user["password_hash"]):
         logger.info("user=%s event=auth 密码错误", username)
         return JSONResponse(status_code=401, content={"error": "这个用户名已被使用，密码不对"})
     logger.info("user=%s event=login 登录成功", username)
@@ -112,15 +147,14 @@ async def api_auth(payload: dict):
 
 
 @app.post("/api/login")
-async def api_login(payload: dict):
+def api_login(payload: dict):
     """登录：{username, password} → {token}。其后请求带 Authorization: Bearer <token>。"""
     username = str(payload.get("username", "")).strip()
     password = str(payload.get("password", ""))
     user = db.get_user_by_username(username)
     if user is None:
         return JSONResponse(status_code=401, content={"error": "用户不存在"})
-    salt, stored_hash = user["password_hash"].split("$", 1)
-    if _hash_password(password, salt) != stored_hash:
+    if not _verify_password(password, user["password_hash"]):
         logger.info("user=%s event=login 密码错误", username)
         return JSONResponse(status_code=401, content={"error": "密码错误"})
     logger.info("user=%s event=login 登录成功", username)
@@ -128,7 +162,7 @@ async def api_login(payload: dict):
 
 
 @app.get("/api/profile")
-async def api_profile(request: Request):
+def api_profile(request: Request):
     """取当前用户档案（个人资料页预填用）。"""
     user_id = _current_user_id(request)
     if user_id is None:
@@ -140,7 +174,7 @@ async def api_profile(request: Request):
 
 
 @app.post("/api/onboarding")
-async def api_onboarding(payload: dict, request: Request):
+def api_onboarding(payload: dict, request: Request):
     """填信息只保存档案，不自动生成建议——首夜建议由用户自己点「下班了」触发。
     档案已存在时是「修改资料」：同样只保存。
     """
@@ -245,6 +279,9 @@ _locks_guard = threading.Lock()
 
 
 def _user_lock(user_id: int) -> threading.Lock:
+    if config.DATABASE_URL:
+        from .postgres import user_lock
+        return user_lock(user_id)
     with _locks_guard:
         return _offwork_locks.setdefault(user_id, threading.Lock())
 
@@ -336,6 +373,8 @@ def _run_and_save_today(user_id: int, username: str, record=None,
     advice, _trace = agent.run_agent(user_id, username, baseline_level=level,
                                      extra_conditions=extra_conditions,
                                      safety_state=safety_state)
+    if not config.DEMO_MODE and advice.get("fallback") and safety_state["final_level"] == "none":
+        raise AIUnavailable()
     conditions["agent_notes"] = advice.get("agent_notes", [])
 
     # 严重疾病劝退入口之二（V2 文档 4.4）：自由输入/纠正里【自述】严重疾病 →
@@ -367,7 +406,7 @@ def _run_and_save_today(user_id: int, username: str, record=None,
 
 
 @app.post("/api/offwork")
-async def api_offwork(request: Request, payload: dict | None = None):
+def api_offwork(request: Request, payload: dict | None = None):
     """「下班了」：先查昨日待回执（7.2），有则让前端先收回执；否则生成今晚建议。
     payload 可带 {"state": "今晚更累"}——生成前前端先问一句今晚状态，作为初始条件注入。"""
     user_id = _current_user_id(request)
@@ -429,7 +468,7 @@ async def api_offwork(request: Request, payload: dict | None = None):
 
 
 @app.post("/api/feedback")
-async def api_feedback(payload: dict, request: Request):
+def api_feedback(payload: dict, request: Request):
     """昨晚回执四档 + 跳过。允许当天内改回执（点错了后悔）：
     若今天的建议已生成且新回执导致档位变化，按新档位重跑 Agent 并返回新建议。
     """
@@ -475,7 +514,7 @@ async def api_feedback(payload: dict, request: Request):
 
 
 @app.post("/api/correct")
-async def api_correct(payload: dict, request: Request):
+def api_correct(payload: dict, request: Request):
     """一击纠正：把纠正项作为新条件，重跑 Agent 主循环（文档 3.2）。"""
     user_id = _current_user_id(request)
     if user_id is None:
@@ -565,7 +604,7 @@ async def api_correct(payload: dict, request: Request):
 
 
 @app.post("/api/free_input")
-async def api_free_input(payload: dict, request: Request):
+def api_free_input(payload: dict, request: Request):
     """自由输入一句话：先存库；当天已有建议则重跑，否则轻确认（文档 3.2 / 第九节）。
     defer=True：即便当天已有建议也不重跑，只落库 + 抽三行，等下次真正触发生成时
     （判断页推进键 / 建议页「我要补充」）一并带走，不会被浪费。判断页的补充和 home
@@ -659,22 +698,14 @@ def _trace_step_label(r: dict) -> str | None:
 
 
 @app.get("/api/agent_trace")
-async def api_agent_trace(request: Request):
+def api_agent_trace(request: Request):
     """最近一次 Agent 循环的轨迹：直接读 logs/trace/ 里该用户最新的文件。"""
     user_id = _current_user_id(request)
     if user_id is None:
         return JSONResponse(status_code=401, content={"error": "未登录"})
-    username = db.get_username(user_id)
-    # 严格匹配 "日期_用户名_时分秒.json"，避免用户名互为前缀时（a 和 a_b）串轨迹。
-    # 按文件真实修改时间取最新——文件名里是虚拟时间，演示中时钟往回拨会让名字排序失真。
-    pattern = re.compile(rf"^\d{{4}}-\d{{2}}-\d{{2}}_{re.escape(username)}_\d{{4,6}}\.json$")
-    files = sorted(
-        (f for f in config.TRACE_DIR.glob("*.json") if pattern.match(f.name)),
-        key=lambda f: f.stat().st_mtime,
-    )
-    if not files:
+    data = db.load_trace(user_id)
+    if not data:
         return {"trace": None}
-    data = json.loads(files[-1].read_text(encoding="utf-8"))
     steps = [s for s in (_trace_step_label(r) for r in data.get("rounds", [])) if s]
 
     # 安全层动作追加进 steps（V2 3.4：侧栏能展示"硬防线拦了什么"；none 且无命中时不加行）
@@ -714,19 +745,19 @@ async def api_meal_photo(file: UploadFile, request: Request):
     if user_id is None:
         return JSONResponse(status_code=401, content={"error": "未登录"})
     username = db.get_username(user_id)
-    image_bytes = await file.read()
+    image_bytes = await file.read(2 * 1024 * 1024 + 1)
     if not image_bytes:
         return JSONResponse(status_code=400, content={"error": "文件为空"})
 
-    # 原图落盘（meal_records.image_path）
-    uploads = config.DATA_DIR / "uploads"
-    uploads.mkdir(parents=True, exist_ok=True)
+    if len(image_bytes) > 2 * 1024 * 1024:
+        return JSONResponse(status_code=413, content={"error": "图片太大，请换一张小于 2MB 的图片"})
+    if file.content_type not in {"image/jpeg", "image/png", "image/webp"}:
+        return JSONResponse(status_code=415, content={"error": "请上传 JPG、PNG 或 WebP 图片"})
     t = clock.now()
-    image_path = uploads / f"{t.strftime('%Y-%m-%d_%H%M%S')}_{username}.jpg"
-    image_path.write_bytes(image_bytes)
+    image_path = db.save_upload(user_id, image_bytes, file.content_type)
 
     try:
-        raw = llm.vision(image_bytes, VISION_PROMPT, mime=file.content_type or "image/jpeg")
+        raw = await run_in_threadpool(llm.vision, image_bytes, VISION_PROMPT, mime=file.content_type or "image/jpeg")
         m = re.search(r"\{.*\}", raw or "", re.S)
         food = json.loads(m.group(0)) if m else None
     except Exception:
@@ -761,7 +792,7 @@ async def api_meal_photo(file: UploadFile, request: Request):
 
 
 @app.post("/api/meal/delete")
-async def api_meal_delete(payload: dict, request: Request):
+def api_meal_delete(payload: dict, request: Request):
     """删除一条饮食记录（识别错了/传错图时的回退）。"""
     user_id = _current_user_id(request)
     if user_id is None:
@@ -774,6 +805,8 @@ async def api_meal_delete(payload: dict, request: Request):
         ).fetchone()
         if row is None:
             return JSONResponse(status_code=400, content={"error": "记录不存在"})
+        if row["image_path"] and row["image_path"].startswith("db:"):
+            db_conn.execute("DELETE FROM uploads WHERE object_key = ? AND user_id = ?", (row["image_path"][3:], user_id))
         db_conn.execute("DELETE FROM meal_records WHERE id = ?", (meal_id,))
         db_conn.commit()
     finally:
@@ -792,7 +825,7 @@ async def api_meal_delete(payload: dict, request: Request):
 
 
 @app.post("/api/meal/update")
-async def api_meal_update(payload: dict, request: Request):
+def api_meal_update(payload: dict, request: Request):
     """更正一条饮食记录：识别错了但用户知道自己吃的是什么，直接用原话覆盖，不重跑视觉模型。"""
     user_id = _current_user_id(request)
     if user_id is None:
@@ -826,9 +859,11 @@ async def api_meal_update(payload: dict, request: Request):
 # ---------- 虚拟时钟（文档第八节） ----------
 
 @app.post("/api/clock")
-async def api_clock(payload: dict):
+def api_clock(payload: dict):
     """时间控制：{advance_minutes: 10} / {advance_hours: 2} / {advance_days: 1} / {set: "..."} / {reset: true}
     三个 advance_* 均支持负数（回拨，演示道具用）。"""
+    if not config.DEMO_MODE:
+        return JSONResponse(status_code=403, content={"error": "线上使用真实时间"})
     try:
         if "advance_minutes" in payload:
             t = clock.advance_hours(float(payload["advance_minutes"]) / 60)
@@ -874,7 +909,7 @@ def _history_items(records, limit: int = _HISTORY_LIMIT) -> list[dict]:
 
 
 @app.get("/api/history")
-async def api_history(request: Request):
+def api_history(request: Request):
     """历史回看只读接口（V3 B4）：按用户倒序返回有建议的记录，上限 30 条。
     不写库、不调模型；severe_flag 用户与其他接口口径一致返回 rejected。"""
     user_id = _current_user_id(request)
@@ -889,7 +924,7 @@ async def api_history(request: Request):
 # ---------- 状态（文档 7.1） ----------
 
 @app.get("/api/state")
-async def api_state(request: Request):
+def api_state(request: Request):
     """前端开屏先问后端"现在该显示哪个视图"。
     M1 判定：未登录 → 401（前端跳登录页）；无档案 → onboarding；有档案 → home。
     advice 视图与 pending_feedback 的判定在 M4 补全（依赖 daily_records 写入逻辑）。
@@ -904,7 +939,7 @@ async def api_state(request: Request):
         # 严重疾病劝退视图（V2 文档 4.4）：语气抱歉而非拒斥；可去「我的资料」修改（误报纠正通道）
         return {"view": "rejected", "message": safety.SEVERE_NOTICE,
                 "virtual_now": clock.now().isoformat(),
-                "virtual_now_display": clock.now_display(), "vday": clock.today()}
+                "virtual_now_display": clock.now_display(), "vday": clock.today(), "demo_mode": config.DEMO_MODE}
     confirm_hint = None
     if state_profile is None:
         view = "onboarding"
@@ -949,6 +984,7 @@ async def api_state(request: Request):
         conn.close()
     return {
         "view": view,
+        "demo_mode": config.DEMO_MODE,
         "confirm_hint": confirm_hint,
         "pending_feedback": pending_feedback,
         "yesterday_feedback": yesterday_feedback,

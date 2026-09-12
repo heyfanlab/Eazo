@@ -8,17 +8,23 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 load_dotenv(BASE_DIR / ".env")
+load_dotenv(BASE_DIR / ".env.local")
+
+IS_VERCEL = os.getenv("VERCEL") == "1"
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+DEMO_MODE = os.getenv("DEMO_MODE", "false" if IS_VERCEL else "true").lower() == "true"
+TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Shanghai")
 
 # ---- 大模型（阿里百炼，OpenAI 兼容格式）----
 # .env 只用一套变量名：LLM_API_KEY / LLM_BASE_URL
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen-plus")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen-plus-2025-07-28")
 VISION_MODEL = os.getenv("VISION_MODEL", "qwen-vl-max")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-v4")
 
 # ---- 路径 ----
-DB_PATH = BASE_DIR / "app.db"
+DB_PATH = Path(os.getenv("SQLITE_PATH", str(BASE_DIR / "app.db")))
 LOG_DIR = BASE_DIR / "logs"
 TRACE_DIR = LOG_DIR / "trace"
 FRONTEND_DIR = BASE_DIR / "frontend"

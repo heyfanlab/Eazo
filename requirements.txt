@@ -4,3 +4,5 @@ uvicorn
 openai
 numpy
 python-dotenv
+python-multipart
+psycopg[binary,pool]>=3.2,<4

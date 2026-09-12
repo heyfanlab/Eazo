@@ -1,0 +1,16 @@
+*
+!backend
+!backend/**
+!frontend
+!frontend/**
+!data
+!data/corpus
+!data/corpus/**
+!data/corpus.npz
+!data/corpus_chunks.json
+!requirements.txt
+!pyproject.toml
+!uv.lock
+!.python-version
+!vercel.json
+backend/__pycache__/**

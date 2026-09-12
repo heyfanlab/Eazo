@@ -1,6 +1,7 @@
 # 一次性脚本（文档 6.3）：语料切块 + 向量化。
 # 运行：/opt/miniconda3/envs/Eazo/bin/python scripts/build_corpus.py
-# 幂等：重跑先清空 corpus_chunks 表和 corpus.npz 再建。
+# 只构建公开语料文件，不读写用户数据库；两份产物需一起部署。
+import json
 import re
 import sys
 from pathlib import Path
@@ -10,7 +11,7 @@ import numpy as np
 # 让脚本能 import backend 包
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from backend import config, db, llm  # noqa: E402
+from backend import config, llm  # noqa: E402
 from backend.logging_setup import setup_logging  # noqa: E402
 
 CHUNK_MIN, CHUNK_MAX = 300, 500   # 每块 300–500 字
@@ -94,7 +95,6 @@ def split_chunks(text: str, doc_name: str) -> list[str]:
 
 def main() -> None:
     setup_logging()
-    db.init_db()
 
     all_chunks = []  # (doc_name, category, chunk_text)
     for md in sorted((config.DATA_DIR / "corpus").glob("*.md")):
@@ -113,22 +113,13 @@ def main() -> None:
         vectors += llm.embed(batch)
         print(f"  向量化 {min(i + EMBED_BATCH, len(all_chunks))}/{len(all_chunks)}")
 
-    # 写库（先清空，幂等）；向量按 id 顺序存 npz，行号 = id - 1
-    conn = db.get_conn()
-    try:
-        conn.execute("DELETE FROM corpus_chunks")
-        conn.execute("DELETE FROM sqlite_sequence WHERE name='corpus_chunks'")
-        for doc_name, category, chunk in all_chunks:
-            conn.execute(
-                "INSERT INTO corpus_chunks (doc_name, category, chunk_text) VALUES (?, ?, ?)",
-                (doc_name, category, chunk),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
+    rows = [dict(id=i + 1, doc_name=name, category=category, chunk_text=chunk)
+            for i, (name, category, chunk) in enumerate(all_chunks)]
+    (config.DATA_DIR / "corpus_chunks.json").write_text(
+        json.dumps(rows, ensure_ascii=False), encoding="utf-8"
+    )
     np.savez(config.DATA_DIR / "corpus.npz", vectors=np.array(vectors, dtype=np.float32))
-    print(f"完成：corpus_chunks 表 {len(all_chunks)} 行，向量存 {config.DATA_DIR / 'corpus.npz'}")
+    print(f"完成：corpus_chunks.json {len(rows)} 行，向量存 {config.DATA_DIR / 'corpus.npz'}")
 
 
 if __name__ == "__main__":

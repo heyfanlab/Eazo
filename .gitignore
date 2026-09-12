@@ -1,5 +1,9 @@
 # 密钥：绝不入库
 .env
+.env.*
+!.env.example
+.vercel/
+.deploy/
 
 # 运行时产物
 app.db
@@ -16,3 +20,5 @@ __pycache__/
 
 # macOS
 .DS_Store
+.vercel
+.env*

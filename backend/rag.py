@@ -1,6 +1,7 @@
 # 检索（文档 6.4）：query 向量化 → 余弦相似度暴力检索 → 按 category 过滤 → top_k。
 # 语料就几百块，numpy 暴力算毫秒级，不装向量数据库。
 import logging
+import json
 
 import numpy as np
 
@@ -27,13 +28,15 @@ def _load() -> bool:
         logger.info("rag 检测到 corpus.npz 更新，重新加载语料")
     vecs = np.load(npz_path)["vectors"]
     _vectors = vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
-    conn = db.get_conn()
-    try:
-        _chunks = conn.execute(
-            "SELECT id, doc_name, category, chunk_text FROM corpus_chunks ORDER BY id"
-        ).fetchall()
-    finally:
-        conn.close()
+    chunks_path = config.DATA_DIR / "corpus_chunks.json"
+    if chunks_path.exists():
+        _chunks = json.loads(chunks_path.read_text(encoding="utf-8"))
+    else:
+        conn = db.get_conn()
+        try:
+            _chunks = conn.execute("SELECT id, doc_name, category, chunk_text FROM corpus_chunks ORDER BY id").fetchall()
+        finally:
+            conn.close()
     if len(_chunks) != len(_vectors):
         logger.error(
             "rag 语料不一致：表 %d 行 vs 向量 %d 行，请重跑 build_corpus.py",

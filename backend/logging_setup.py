@@ -17,16 +17,17 @@ def setup_logging() -> None:
     if _initialized:
         return
 
-    config.LOG_DIR.mkdir(parents=True, exist_ok=True)
-    config.TRACE_DIR.mkdir(parents=True, exist_ok=True)
-
     formatter = logging.Formatter(_FORMAT, datefmt=_DATEFMT)
 
     # 文件：按天滚动，保留 14 天
-    file_handler = TimedRotatingFileHandler(
-        config.LOG_DIR / "app.log", when="midnight", backupCount=14, encoding="utf-8"
-    )
-    file_handler.setFormatter(formatter)
+    file_handler = None
+    if not config.IS_VERCEL:
+        config.LOG_DIR.mkdir(parents=True, exist_ok=True)
+        config.TRACE_DIR.mkdir(parents=True, exist_ok=True)
+        file_handler = TimedRotatingFileHandler(
+            config.LOG_DIR / "app.log", when="midnight", backupCount=14, encoding="utf-8"
+        )
+        file_handler.setFormatter(formatter)
 
     # 控制台
     console_handler = logging.StreamHandler()
@@ -34,7 +35,8 @@ def setup_logging() -> None:
 
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    root.addHandler(file_handler)
+    if file_handler:
+        root.addHandler(file_handler)
     root.addHandler(console_handler)
 
     _initialized = True

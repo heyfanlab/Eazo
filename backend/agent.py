@@ -319,9 +319,14 @@ def _exec_tool(name: str, args: dict, user_id: int, notes: list[str]):
 
 def _save_trace(username: str, trace: dict) -> None:
     """轨迹落盘（文档 11.2）：一次运行一个缩进 JSON 文件。"""
+    user = db.get_user_by_username(username)
+    if user:
+        db.save_trace(user["id"], trace)
+    if config.IS_VERCEL:
+        return
     t = clock.now()
     # 文件名带秒，避免同一分钟内多次重跑（一击纠正）互相覆盖
-    path = config.TRACE_DIR / f"{t.strftime('%Y-%m-%d')}_{username}_{t.strftime('%H%M%S')}.json"
+    path = config.TRACE_DIR / f"{t.strftime('%Y-%m-%d')}_{user['id'] if user else 'unknown'}_{t.strftime('%H%M%S')}.json"
     with open(path, "w", encoding="utf-8") as f:
         json.dump(trace, f, ensure_ascii=False, indent=2)
     logger.info("trace 已写入 %s", path)
@@ -347,6 +352,10 @@ def run_agent(user_id: int, username: str, baseline_level: int = 3,
 
     round_no = 0
     while round_no < MAX_ROUNDS:
+        if time.perf_counter() - start > 180:
+            advice = dict(FALLBACK_ADVICE)
+            trace["rounds"].append({"error": "请求耗时过长，使用兜底建议"})
+            break
         round_no += 1
         try:
             msg = llm.chat(messages, tools=tools.TOOL_DEFS)
@@ -363,6 +372,9 @@ def run_agent(user_id: int, username: str, baseline_level: int = 3,
                 "tool_calls": [tc.model_dump() for tc in msg.tool_calls],
             })
             for tc in msg.tool_calls:
+                if time.perf_counter() - start > 180:
+                    advice = dict(FALLBACK_ADVICE)
+                    break
                 try:
                     args = json.loads(tc.function.arguments or "{}")
                 except json.JSONDecodeError:
@@ -378,6 +390,8 @@ def run_agent(user_id: int, username: str, baseline_level: int = 3,
                 })
                 logger.info("user=%s agent round=%d tool=%s args=%s",
                             username, round_no, tc.function.name, args)
+            if advice is not None:
+                break
             continue
 
         # 模型给了最终输出 → 校验 JSON

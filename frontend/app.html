@@ -496,7 +496,7 @@
   </main>
 
   <!-- 虚拟时钟控制条（②-25）：演示道具，常驻 -->
-  <div class="clockbar" id="clockBar">
+  <div class="clockbar" id="clockBar" style="display:none">
     <b id="clockDisplay">加载中…</b>
     <button type="button" data-clock='{"advance_days":-1}'>−1d</button>
     <button type="button" data-clock='{"advance_hours":-1}'>−1h</button>
@@ -899,6 +899,7 @@
       return '夜深了';
     }
     function paintClocks(state) {
+      document.getElementById("clockBar").style.display = state.demo_mode ? "flex" : "none";
       document.getElementById('clockDisplay').textContent = state.virtual_now_display;
       const t = hm(state.virtual_now);
       document.getElementById('homeClock').textContent = t + ' · 又到这个点';
@@ -1460,6 +1461,7 @@
       const data = await api('/api/offwork', payload || {});
       setLoading(false);
       if (!data) return;
+      if (data.error) { toast(data.error); return; }
       if (data.rejected) { await refreshState(); return; }
       if (data.need_feedback) {
         pendingOffworkPayload = payload || {};

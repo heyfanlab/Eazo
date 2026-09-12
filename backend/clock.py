@@ -2,8 +2,9 @@
 # 全后端业务逻辑禁止直接用系统时间，一律用本模块的 now()。
 import logging
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-from . import db
+from . import db, config
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,8 @@ DEMO_HOUR, DEMO_MINUTE = DEMO_START.hour, DEMO_START.minute
 
 def now() -> datetime:
     """当前虚拟时间。"""
+    if not config.DEMO_MODE:
+        return datetime.now(ZoneInfo(config.TIMEZONE)).replace(tzinfo=None, microsecond=0)
     conn = db.get_conn()
     try:
         row = conn.execute("SELECT virtual_now FROM app_clock WHERE id = 1").fetchone()
@@ -37,6 +40,8 @@ def now_display() -> str:
 
 
 def _write(t: datetime) -> datetime:
+    if not config.DEMO_MODE:
+        raise ValueError("线上使用真实时间，不能修改演示时钟")
     t = t.replace(microsecond=0)
     conn = db.get_conn()
     try:
