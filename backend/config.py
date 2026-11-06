@@ -19,8 +19,8 @@ TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Shanghai")
 # .env 只用一套变量名：LLM_API_KEY / LLM_BASE_URL
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen-plus-2025-07-28")
-VISION_MODEL = os.getenv("VISION_MODEL", "qwen-vl-max")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen-plus-2025-12-01")
+VISION_MODEL = os.getenv("VISION_MODEL", "qwen3-vl-plus")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-v4")
 
 # ---- 路径 ----
