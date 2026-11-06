@@ -1,5 +1,6 @@
 # FastAPI 入口 + 路由。
 # 启动：uvicorn backend.main:app --reload
+import asyncio
 import hashlib
 import hmac
 import json
@@ -737,6 +738,9 @@ VISION_PROMPT = """识别图中食物，输出 JSON（不要输出其他内容�
 {"名称": "整份食物的概括名称", "估计分量": "大概分量", "类别": "粉面/炸物/米饭/火锅/烧烤/甜品饮料/轻食/家常 之一", "备注": "包含的主要食材，逗号分隔"}
 不确定就写最可能的，不要拒答。"""
 
+# 必须小于前端 /api/meal/photo 的 45s AbortController，留出存图写库的余量。
+VISION_DEADLINE_S = 35
+
 
 @app.post("/api/meal/photo")
 async def api_meal_photo(file: UploadFile, request: Request):
@@ -757,9 +761,19 @@ async def api_meal_photo(file: UploadFile, request: Request):
     image_path = db.save_upload(user_id, image_bytes, file.content_type)
 
     try:
-        raw = await run_in_threadpool(llm.vision, image_bytes, VISION_PROMPT, mime=file.content_type or "image/jpeg")
+        # 总时长封顶：llm 层的超时管不住 DNS 解析（getaddrinfo 不受 socket 超时约束），
+        # 跨境偶发卡死时可能拖过前端的 45s 放弃线——前端已提示「认得有点久」，后端却还在
+        # 稍后写入一条记录。这里到点就走兜底并按时返回；后台线程自行结束，结果丢弃。
+        raw = await asyncio.wait_for(
+            run_in_threadpool(llm.vision, image_bytes, VISION_PROMPT,
+                              mime=file.content_type or "image/jpeg"),
+            timeout=VISION_DEADLINE_S,
+        )
         m = re.search(r"\{.*\}", raw or "", re.S)
         food = json.loads(m.group(0)) if m else None
+    except asyncio.TimeoutError:
+        logger.error("user=%s vision 超过 %ss 总时长上限", username, VISION_DEADLINE_S)
+        food = None
     except Exception:
         food = None
     recognized = bool(food and food.get("名称"))
