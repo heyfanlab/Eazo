@@ -28,10 +28,13 @@ python -m venv .venv
 - `CHAT_MODEL`、`VISION_MODEL`、`EMBED_MODEL`：分别支持工具调用、图片识别、向量检索。
 - `DEMO_MODE=false`、`APP_TIMEZONE=Asia/Shanghai`。
 
-```sh
-npx vercel link
-npx vercel deploy --prod
-```
+项目已关联 GitHub 仓库 `heyfanlab/Eazo`，生产分支是 `main`：
+
+- 推送到 `main` → 自动部署 Production（`lite-me.vercel.app`）。
+- 推送到其它分支 → 自动生成预览部署（受 Vercel 登录保护）。
+- 不要再在本地执行 `vercel deploy --prod`：它上传的是本地文件夹，会让线上和 `main` 对不上。
+
+团队参赛时的原始仓库是 `Wolinaxia/Eazo`（本地远程名 `team`），不参与部署。
 
 `.vercelignore` 仅包含运行代码、前端、公开知识库及依赖配置。
 本地密钥、账号数据库、上传图片、日志、路演材料和过程文件不进入部署包。
