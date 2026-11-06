@@ -914,8 +914,15 @@
     /* ---------- 夜间闭环状态（第 7.2/8 条）：接受状态不落库（①-8），只记 localStorage。
        Q5：新一天回初始页的时间点是凌晨 04:00 —— 所以"跨过零点但还没到 4 点"时锁定继续有效，
        否则 23:50 接受、00:10 就被弹回首页，夜还没过完。 ---------- */
-    const ACCEPTED_KEY = 'accepted_vday', DONE_KEY = 'night_done_vday';
-    const DECLINED_KEY = 'declined_vday';   // 今晚不做：当天终止态，抑制建议复活
+    // 按账号隔离：同一浏览器换账号登录时，上一个账号的「今晚不做 / 已接受 / 已问过下班」
+    // 不能串到新账号（实测：A 点了今晚不做，换 B 登录后「开始今晚」只回「今晚先这样，明天见」）。
+    // username 由 auth.html 登录时写入；旧版不带账号后缀的键一次性清掉。
+    const NIGHT_NS = ':' + (localStorage.getItem('username') || '');
+    const ACCEPTED_KEY = 'accepted_vday' + NIGHT_NS, DONE_KEY = 'night_done_vday' + NIGHT_NS;
+    const DECLINED_KEY = 'declined_vday' + NIGHT_NS;   // 今晚不做：当天终止态，抑制建议复活
+    const REMINDER_KEY = 'offworkReminder' + NIGHT_NS;
+    ['accepted_vday', 'night_done_vday', 'declined_vday', 'offworkReminder']
+      .forEach(k => localStorage.removeItem(k));
     function isNextDay(prev, cur) {
       const a = new Date(prev + 'T00:00:00'), b = new Date(cur + 'T00:00:00');
       return Math.round((b - a) / 86400000) === 1;
@@ -1158,10 +1165,10 @@
 
     /* ---------- 下班提醒条（②-19，逻辑照搬旧版） ---------- */
     function reminderStore(vday, patch) {
-      const cur = JSON.parse(localStorage.getItem('offworkReminder') || '{}');
+      const cur = JSON.parse(localStorage.getItem(REMINDER_KEY) || '{}');
       const rec = cur.vday === vday ? cur : { vday, asked: 0, nextAskAt: null, done: false };
       Object.assign(rec, patch || {});
-      localStorage.setItem('offworkReminder', JSON.stringify(rec));
+      localStorage.setItem(REMINDER_KEY, JSON.stringify(rec));
       return rec;
     }
     function reminderEnabled() { return localStorage.getItem('reminderOff') !== '1'; }
