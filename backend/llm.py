@@ -8,11 +8,14 @@ import time
 import httpx
 from openai import DefaultHttpxClient, OpenAI
 
-from . import config
+from . import config, dns_cache
 
 logger = logging.getLogger(__name__)
 
 _client = None
+
+if config.LLM_BASE_URL:
+    dns_cache.prewarm(httpx.URL(config.LLM_BASE_URL).host)
 
 # 线上函数在 Vercel 新加坡，百炼在北京，每次调用都跨境，偶发建连卡死
 # （实测一次识图卡 61s 后报 ConnectError: [Errno 99]）。三处加固：
@@ -47,11 +50,16 @@ class _PhaseTracingClient(DefaultHttpxClient):
 
 
 def _http_client() -> httpx.Client:
-    return _PhaseTracingClient(transport=httpx.HTTPTransport(
+    transport = httpx.HTTPTransport(
         local_address="0.0.0.0",
         retries=1,
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
-    ))
+    )
+    # 域名解析换成 dns_cache：系统 DNS 限时 2s → DoH → 缓存兜底（原因见 dns_cache.py 顶部）。
+    # httpx 没有公开传 network_backend 的参数，只能替换其连接池上的这个属性；
+    # httpx/httpcore 版本由 uv.lock 锁定，升级时 scripts/test_deployment.py 会覆盖到。
+    transport._pool._network_backend = dns_cache.CachedDNSBackend()
+    return _PhaseTracingClient(transport=transport)
 
 
 def get_client() -> OpenAI:

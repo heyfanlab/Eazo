@@ -110,6 +110,36 @@ class DeploymentTests(unittest.TestCase):
             conn.close()
         self.assertEqual(n, 1)
 
+    def test_model_host_dns_is_bounded_and_cached(self):
+        # 线上实测：系统 DNS 解析百炼域名会卡几十秒。必须限时、切 DoH、失败时沿用缓存。
+        import socket, time
+        from backend import dns_cache, llm
+        host = "model.example"
+        dns_cache._cache.clear()
+        doh = unittest.mock.Mock()
+        doh.return_value.json.return_value = {"Answer": [{"type": 5, "data": "cname."},
+                                                         {"type": 1, "data": "203.0.113.7"}]}
+
+        def hang(h, *a, **k):
+            time.sleep(5)
+            raise socket.gaierror(-9, "Address family for hostname not supported")
+        with patch.object(dns_cache, "SYSTEM_DNS_TIMEOUT_S", 0.2), \
+             patch("socket.getaddrinfo", hang), patch("httpx.get", doh):
+            t = time.perf_counter()
+            self.assertEqual(dns_cache.resolve_ipv4(host), ["203.0.113.7"])
+            self.assertLess(time.perf_counter() - t, 2)
+        # 缓存过期 + 系统 DNS 与 DoH 全挂 → 沿用上次结果，而不是报错
+        dns_cache._cache[host] = (["203.0.113.7"], time.monotonic() - 10 * dns_cache.CACHE_TTL_S)
+        with patch.object(dns_cache, "SYSTEM_DNS_TIMEOUT_S", 0.2), \
+             patch("socket.getaddrinfo", side_effect=socket.gaierror(-2, "x")), \
+             patch("httpx.get", side_effect=RuntimeError("offline")):
+            self.assertEqual(dns_cache.resolve_ipv4(host), ["203.0.113.7"])
+        self.assertEqual(dns_cache.resolve_ipv4("192.0.2.1"), ["192.0.2.1"])
+        dns_cache._cache.clear()
+        # 网络后端确实接在模型客户端的连接池上（httpx 升级若改了内部结构，这里会先失败）
+        pool = llm._http_client()._transport._pool
+        self.assertIsInstance(pool._network_backend, dns_cache.CachedDNSBackend)
+
     def test_trace_persists_and_is_private(self):
         uid=db.get_user_by_username("alice")["id"]
         db.save_trace(uid,{"rounds":[{"output":"done"}],"duration_s":1,"final":{}})
