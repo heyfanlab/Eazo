@@ -760,19 +760,22 @@ async def api_meal_photo(file: UploadFile, request: Request):
     t = clock.now()
     image_path = db.save_upload(user_id, image_bytes, file.content_type)
 
+    phases: list[str] = []
     try:
         # 总时长封顶：llm 层的超时管不住 DNS 解析（getaddrinfo 不受 socket 超时约束），
         # 跨境偶发卡死时可能拖过前端的 45s 放弃线——前端已提示「认得有点久」，后端却还在
         # 稍后写入一条记录。这里到点就走兜底并按时返回；后台线程自行结束，结果丢弃。
         raw = await asyncio.wait_for(
             run_in_threadpool(llm.vision, image_bytes, VISION_PROMPT,
-                              mime=file.content_type or "image/jpeg"),
+                              mime=file.content_type or "image/jpeg", phases=phases),
             timeout=VISION_DEADLINE_S,
         )
         m = re.search(r"\{.*\}", raw or "", re.S)
         food = json.loads(m.group(0)) if m else None
     except asyncio.TimeoutError:
-        logger.error("user=%s vision 超过 %ss 总时长上限", username, VISION_DEADLINE_S)
+        # phases 由工作线程持续追加：最后一项就是卡住的那一步
+        logger.error("user=%s vision 超过 %ss 总时长上限 图片=%dKB 已到阶段=%s",
+                     username, VISION_DEADLINE_S, len(image_bytes) // 1024, list(phases))
         food = None
     except Exception:
         food = None

@@ -2,6 +2,7 @@
 # chat：Agent 主循环用；embed：RAG 用；vision：食物照片识别用。
 import base64
 import logging
+import threading
 import time
 
 import httpx
@@ -24,8 +25,29 @@ CHAT_TIMEOUT = httpx.Timeout(30, connect=5)
 VISION_TIMEOUT = httpx.Timeout(20, connect=5)
 
 
+_phase_sink = threading.local()
+
+
+class _PhaseTracingClient(DefaultHttpxClient):
+    """调用方在当前线程挂一个 list（_phase_sink.events）时，把 httpcore 各阶段
+    （建连/TLS/上传请求体/等响应头）的时间点追加进去，用于定位跨境卡在哪一步。
+    没挂 list 时什么都不做。list 由调用方持有，工作线程被总时长上限放弃后，
+    调用方仍能读到它已经走到了哪一步。"""
+
+    def send(self, request, **kwargs):
+        events = getattr(_phase_sink, "events", None)
+        if events is not None:
+            t0 = time.perf_counter()
+
+            def trace(name, info):
+                if name.endswith((".started", ".complete", ".failed")):
+                    events.append(f"{name.split('.', 1)[1]}@{time.perf_counter() - t0:.1f}s")
+            request.extensions["trace"] = trace
+        return super().send(request, **kwargs)
+
+
 def _http_client() -> httpx.Client:
-    return DefaultHttpxClient(transport=httpx.HTTPTransport(
+    return _PhaseTracingClient(transport=httpx.HTTPTransport(
         local_address="0.0.0.0",
         retries=1,
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
@@ -70,8 +92,12 @@ def chat(messages: list[dict], tools: list[dict] | None = None):
                 raise
 
 
-def vision(image_bytes: bytes, prompt: str, mime: str = "image/jpeg") -> str:
-    """视觉模型识别图片，返回文本。失败重试 1 次，再失败抛异常（调用方兜底）。"""
+def vision(image_bytes: bytes, prompt: str, mime: str = "image/jpeg",
+           phases: list | None = None) -> str:
+    """视觉模型识别图片，返回文本。失败抛异常（调用方兜底）。
+    phases：传入一个 list 时，记录本次 HTTP 各阶段时间点（见 _PhaseTracingClient）。"""
+    phases = [] if phases is None else phases
+    _phase_sink.events = phases
     b64 = base64.b64encode(image_bytes).decode()
     messages = [{
         "role": "user",
@@ -88,13 +114,16 @@ def vision(image_bytes: bytes, prompt: str, mime: str = "image/jpeg") -> str:
             model=config.VISION_MODEL, messages=messages
         )
         logger.info(
-            "llm_call model=%s vision 耗时=%.1fs",
-            config.VISION_MODEL, time.perf_counter() - start,
+            "llm_call model=%s vision 耗时=%.1fs 图片=%dKB 阶段=%s",
+            config.VISION_MODEL, time.perf_counter() - start, len(image_bytes) // 1024, phases,
         )
         return resp.choices[0].message.content
     except Exception:
-        logger.error("vision 调用失败（不重试，走调用方兜底）", exc_info=True)
+        logger.error("vision 调用失败（不重试，走调用方兜底）图片=%dKB 阶段=%s",
+                     len(image_bytes) // 1024, phases, exc_info=True)
         raise
+    finally:
+        _phase_sink.events = None
 
 
 def embed(texts: list[str]) -> list[list[float]]:
