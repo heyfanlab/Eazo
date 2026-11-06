@@ -70,6 +70,46 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(r.json()["code"],"AI_UNAVAILABLE")
         self.assertEqual(self.client.get("/api/history",headers=self.headers).json()["history"],[])
 
+    def test_concurrent_regeneration_for_one_user_is_serialized(self):
+        # 双击「纠正」/纠正撞上补充：同一用户的「读记录→改条件→重生成」必须串行（用户锁）
+        import threading, time
+        uid = db.get_user_by_username("alice")["id"]
+        self.client.post("/api/onboarding", headers=self.headers, json={"off_work_end": "18:00", "wake_time": "08:00"})
+        advice = dict(agent.FALLBACK_ADVICE, fallback=False)
+        db.insert_daily_record(uid, clock.today(), "{}", json.dumps(advice, ensure_ascii=False), 3)
+        running, peak, guard = [0], [0], threading.Lock()
+
+        def slow_agent(*a, **k):
+            with guard:
+                running[0] += 1
+                peak[0] = max(peak[0], running[0])
+            time.sleep(0.5)
+            with guard:
+                running[0] -= 1
+            return dict(advice), {}
+
+        def offline(*a, **k):
+            raise RuntimeError("断网")   # 安全 L2 走回退 L1：不碰真实模型，生成前的耗时稳定且很短
+
+        results = []
+        def hit(path, body):
+            results.append(self.client.post(path, headers=self.headers, json=body).status_code)
+        with patch.object(agent, "run_agent", side_effect=slow_agent), \
+             patch("backend.llm.chat", side_effect=offline):
+            ts = [threading.Thread(target=hit, args=("/api/correct", {"type": "今天还行"})),
+                  threading.Thread(target=hit, args=("/api/correct", {"type": "时间更少"})),
+                  threading.Thread(target=hit, args=("/api/free_input", {"text": "今天有点累"}))]
+            for t in ts: t.start()
+            for t in ts: t.join()
+        self.assertEqual(results, [200, 200, 200])
+        self.assertEqual(peak[0], 1, "同一用户的重生成出现了并发")
+        conn = db.get_conn()
+        try:
+            n = conn.execute("SELECT COUNT(*) AS n FROM daily_records WHERE user_id = ?", (uid,)).fetchone()["n"]
+        finally:
+            conn.close()
+        self.assertEqual(n, 1)
+
     def test_trace_persists_and_is_private(self):
         uid=db.get_user_by_username("alice")["id"]
         db.save_trace(uid,{"rounds":[{"output":"done"}],"duration_s":1,"final":{}})

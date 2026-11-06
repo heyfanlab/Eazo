@@ -125,8 +125,11 @@ def get_conn() -> sqlite3.Connection:
         return Connection()
     if config.IS_VERCEL:
         raise RuntimeError("Vercel deployment requires DATABASE_URL; local SQLite is not persistent")
-    conn = sqlite3.connect(config.DB_PATH)
+    # 仅本地开发走 SQLite（线上是 Postgres）。带模型调用的路由是普通 def、跑在线程池里，
+    # 是真并发：timeout=30 让并发写等锁而不是直接抛 database is locked；WAL 让读写不互斥。
+    conn = sqlite3.connect(config.DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 

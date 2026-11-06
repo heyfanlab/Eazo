@@ -487,7 +487,14 @@ def api_feedback(payload: dict, request: Request):
     logger.info("user=%s event=feedback record=%s vday=%s 反馈=%s",
                 username, record["id"], record["vday"], feedback)
 
-    # 改回执的连锁：今天建议已生成 + 新回执算出的档位不同 → 重算档位并重出今晚建议
+    # 改回执的连锁：今天建议已生成 + 新回执算出的档位不同 → 重算档位并重出今晚建议。
+    # 与 /api/offwork 同一把用户锁：读记录→改档位→重生成必须整段原子，否则和「下班了」/
+    # 其它纠正并发会双重生成、互相覆盖（线上是 Postgres advisory 锁，跨实例有效）。
+    with _user_lock(user_id):
+        return _feedback_chain_locked(user_id, username, record, feedback)
+
+
+def _feedback_chain_locked(user_id: int, username: str, record, feedback: str):
     today_rec = db.get_daily_record(user_id, clock.today())
     if today_rec and today_rec["advice_json"] and record["vday"] < clock.today():
         new_level = _compute_today_baseline(user_id)
@@ -526,6 +533,13 @@ def api_correct(payload: dict, request: Request):
     p = db.get_profile(user_id)
     if p is not None and p["severe_flag"]:
         return {"rejected": True, "message": safety.SEVERE_NOTICE}
+    # 与 /api/offwork 同一把用户锁：各分支都是「读记录→改条件→重生成」，整段原子，
+    # 防止和「下班了」/回执连锁/补充并发生成两条当日记录或互相覆盖。
+    with _user_lock(user_id):
+        return _correct_locked(user_id, ctype, p)
+
+
+def _correct_locked(user_id: int, ctype: str, p):
     record = db.get_daily_record(user_id, clock.today())
     if record is None or not record["advice_json"]:
         return JSONResponse(status_code=400, content={"error": "今天还没有建议，先点「下班了」"})
@@ -667,10 +681,13 @@ def api_free_input(payload: dict, request: Request):
         return {"ok": True, "message": "记下了。晚上生成建议时会考虑进去。",
                 "applied": applied}
 
-    conditions = json.loads(record["conditions_json"] or "{}")
-    extra = [f"用户一击纠正：{c}" for c in conditions.get("纠正", [])]
-    extra.append("用户刚补充了一句话（见【今天已知】的自由输入），请把它纳入考虑")
-    advice = _run_and_save_today(user_id, username, record=record, extra_conditions=extra)
+    # 当天已有建议 → 立即重算。锁内重读记录：等锁期间可能已被「下班了」/纠正改写过
+    with _user_lock(user_id):
+        record = db.get_daily_record(user_id, clock.today()) or record
+        conditions = json.loads(record["conditions_json"] or "{}")
+        extra = [f"用户一击纠正：{c}" for c in conditions.get("纠正", [])]
+        extra.append("用户刚补充了一句话（见【今天已知】的自由输入），请把它纳入考虑")
+        advice = _run_and_save_today(user_id, username, record=record, extra_conditions=extra)
     if advice.get("agent_notes"):
         db.set_free_input_extracted(
             fid, json.dumps(advice["agent_notes"], ensure_ascii=False))
